@@ -6,7 +6,7 @@ Elm-style signals for Scala/Scala.js.
 
 import html.Attribute._
 import html.Node._
-import scala_signal.Address
+import Address
 import scalajs.js.Dynamic
 import html.converters.ReactEndpoint
 

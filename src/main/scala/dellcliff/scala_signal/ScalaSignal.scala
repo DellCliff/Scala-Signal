@@ -1,6 +1,79 @@
-package scala_signal
+package dellcliff.scala_signal
 
 import scala.concurrent.{ExecutionContext, Future}
+
+sealed trait Address[A] {
+  def apply(x: A) = send(x)
+
+  def send(x: A): Future[Unit]
+
+  def proxy[B](f: B => A): Address[B]
+
+  def proxy(f: () => A): Address[Unit] = proxy({ x: Any => f() })
+}
+
+private class AddressImpl[A]
+(signal: SignalImpl[A])
+(implicit executor: ExecutionContext) extends Address[A] {
+  override def send(x: A): Future[Unit] =
+    signal.observable.onNext(x)
+
+  override def proxy[B](f: B => A): Address[B] = {
+    val newSignal = new SignalImpl[B](new Observable(None))
+    newSignal.observable.addObserver({ x =>
+      signal.observable.onNext(f(x))
+    })
+    new AddressImpl(newSignal)
+  }
+}
+
+sealed trait Mailbox[A] {
+  val address: Address[A]
+  val signal: Signal[A]
+}
+
+object Mailbox {
+  def mailbox[A]()(implicit executor: ExecutionContext): Mailbox[A] = {
+    val newSignal = new SignalImpl[A](new Observable(None))
+    new Mailbox[A] {
+      val address = new AddressImpl(newSignal)
+      val signal = newSignal
+    }
+  }
+
+  def mailbox[A]
+  (default: A)
+  (implicit executor: ExecutionContext): Mailbox[A] = {
+    val newSignal = new SignalImpl(new Observable(Some(default)))
+    new Mailbox[A] {
+      val address = new AddressImpl(newSignal)
+      val signal = newSignal
+    }
+  }
+}
+
+private class Observable[A]
+(init: Option[A])
+(implicit executor: ExecutionContext) {
+  private val lock = new Object
+  private var observers: Set[A => Any] = Set()
+  private var value: Option[A] = init
+
+  def addObserver(f: A => Any): Unit = lock.synchronized {
+    observers = observers ++ Set((x: A) => Future(f(x)))
+    for (x <- value) Future(f(x))
+  }
+
+  def onNextSync(x: A): Unit = lock.synchronized {
+    value = Some(x)
+    for (f <- observers) Future(f(x))
+  }
+
+  def onNext(x: A): Future[Unit] =
+    Future(onNextSync(x))
+
+  def state(): Option[A] = value
+}
 
 sealed trait Signal[A] {
   def dropRepeats(): Signal[A]
@@ -59,9 +132,7 @@ private class SignalImpl[A]
     observable.addObserver({ x =>
       f(x) match {
         case signal: SignalImpl[B] =>
-          signal.observable.addObserver({ y =>
-            newSignal.observable.onNextSync(y)
-          })
+          signal.observable.addObserver(newSignal.observable.onNextSync)
         case other =>
       }
     })
@@ -107,56 +178,6 @@ private class SignalImpl[A]
   }
 }
 
-sealed trait Address[A] {
-  def apply(x: A) = send(x)
-
-  def send(x: A): Future[Unit]
-
-  def proxy[B](f: B => A): Address[B]
-
-  def proxy(f: () => A): Address[Unit] = proxy({ x: Any => f() })
-}
-
-private class AddressImpl[A]
-(signal: SignalImpl[A])
-(implicit executor: ExecutionContext) extends Address[A] {
-  override def send(x: A): Future[Unit] =
-    signal.observable.onNext(x)
-
-  override def proxy[B](f: B => A): Address[B] = {
-    val newSignal = new SignalImpl[B](new Observable(None))
-    newSignal.observable.addObserver({ x =>
-      signal.observable.onNext(f(x))
-    })
-    new AddressImpl(newSignal)
-  }
-}
-
-sealed trait Mailbox[A] {
-  val address: Address[A]
-  val signal: Signal[A]
-}
-
-object Mailbox {
-  def mailbox[A]()(implicit executor: ExecutionContext): Mailbox[A] = {
-    val newSignal = new SignalImpl[A](new Observable(None))
-    new Mailbox[A] {
-      val address = new AddressImpl(newSignal)
-      val signal = newSignal
-    }
-  }
-
-  def mailbox[A]
-  (default: A)
-  (implicit executor: ExecutionContext): Mailbox[A] = {
-    val newSignal = new SignalImpl(new Observable(Some(default)))
-    new Mailbox[A] {
-      val address = new AddressImpl(newSignal)
-      val signal = newSignal
-    }
-  }
-}
-
 object StartApp {
   type UpdateFunc[A, M] = (A, M) => M
 
@@ -172,27 +193,4 @@ object StartApp {
       .foldP(model)(update)
       .map(view(actions.address, _))
   }
-}
-
-private class Observable[A]
-(init: Option[A])
-(implicit executor: ExecutionContext) {
-  private val lock = new Object
-  private var observers: Set[A => Any] = Set()
-  private var value: Option[A] = init
-
-  def addObserver(f: A => Any): Unit = lock.synchronized {
-    observers = observers ++ Set((x: A) => Future(f(x)))
-    for (x <- value) Future(f(x))
-  }
-
-  def onNextSync(x: A): Unit = lock.synchronized {
-    value = Some(x)
-    for (f <- observers) Future(f(x))
-  }
-
-  def onNext(x: A): Future[Unit] =
-    Future(onNextSync(x))
-
-  def state(): Option[A] = value
 }

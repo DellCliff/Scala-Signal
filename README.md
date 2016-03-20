@@ -87,7 +87,7 @@ object Main extends JSApp {
             }.toList: _*)
 
     for {
-      newView <- state.StartApp.start(
+      newView <- scala_signal.StartApp.start(
         CounterListModel(Map(), 0), counterListUpdate, counterListView)
       reactElement <- ReactEndpoint.makeDom(newView)
     } {

@@ -12,69 +12,6 @@ sealed trait Address[A] {
   def proxy(f: () => A): Address[Unit] = proxy({ x: Any => f() })
 }
 
-private class AddressImpl[A]
-(signal: SignalImpl[A])
-(implicit executor: ExecutionContext) extends Address[A] {
-  override def send(x: A): Future[Unit] =
-    signal.observable.onNext(x)
-
-  override def proxy[B](f: B => A): Address[B] = {
-    val newSignal = new SignalImpl[B](new Observable(None))
-    newSignal.observable.addObserver({ x =>
-      signal.observable.onNext(f(x))
-    })
-    new AddressImpl(newSignal)
-  }
-}
-
-sealed trait Mailbox[A] {
-  val address: Address[A]
-  val signal: Signal[A]
-}
-
-object Mailbox {
-  def mailbox[A]()(implicit executor: ExecutionContext): Mailbox[A] = {
-    val newSignal = new SignalImpl[A](new Observable(None))
-    new Mailbox[A] {
-      val address = new AddressImpl(newSignal)
-      val signal = newSignal
-    }
-  }
-
-  def mailbox[A]
-  (default: A)
-  (implicit executor: ExecutionContext): Mailbox[A] = {
-    val newSignal = new SignalImpl(new Observable(Some(default)))
-    new Mailbox[A] {
-      val address = new AddressImpl(newSignal)
-      val signal = newSignal
-    }
-  }
-}
-
-private class Observable[A]
-(init: Option[A])
-(implicit executor: ExecutionContext) {
-  private val lock = new Object
-  private var observers: Set[A => Any] = Set()
-  private var value: Option[A] = init
-
-  def addObserver(f: A => Any): Unit = lock.synchronized {
-    observers = observers ++ Set((x: A) => Future(f(x)))
-    for (x <- value) Future(f(x))
-  }
-
-  def onNextSync(x: A): Unit = lock.synchronized {
-    value = Some(x)
-    for (f <- observers) Future(f(x))
-  }
-
-  def onNext(x: A): Future[Unit] =
-    Future(onNextSync(x))
-
-  def state(): Option[A] = value
-}
-
 sealed trait Signal[A] {
   def dropRepeats(): Signal[A]
 
@@ -84,98 +21,128 @@ sealed trait Signal[A] {
 
   def foldP[B](init: B)(f: (A, B) => B): Signal[B]
 
-  def foreach[U](f: A => U): Unit = this.map(f)
+  def foreach[U](f: A => U): Unit
 
   def map[B](f: A => B): Signal[B]
 
   def sampleOn[B](on: Signal[B]): Signal[A]
 }
 
+sealed trait Mailbox[A] {
+  val address: Address[A]
+  val signal: Signal[A]
+}
+
+private class AddressImpl[A]
+(signal: SignalImpl[A])
+(implicit executor: ExecutionContext) extends Address[A] {
+  override def send(x: A): Future[Unit] = signal.observable.onNext(x)
+
+  override def proxy[B](f: (B) => A): Address[B] = {
+    val newObservable = new Observable[B](None)
+    newObservable.subscribe { x =>
+      signal.observable.onNext(f(x))
+    }
+    new AddressImpl(new SignalImpl(newObservable))
+  }
+}
+
+object Mailbox {
+  def mailbox[A]()(implicit executor: ExecutionContext): Mailbox[A] = {
+    val newSignal = new SignalImpl(new Observable[A](None))
+    new Mailbox[A] {
+      override val address: Address[A] = new AddressImpl(newSignal)
+      override val signal: Signal[A] = newSignal
+    }
+  }
+
+  def mailbox[A]
+  (default: A)
+  (implicit executor: ExecutionContext): Mailbox[A] = {
+    val newSignal = new SignalImpl(new Observable(Some(default)))
+    new Mailbox[A] {
+      override val address: Address[A] = new AddressImpl(newSignal)
+      override val signal: Signal[A] = newSignal
+    }
+  }
+}
+
 object Signal {
   def constant[A](x: A)(implicit executor: ExecutionContext): Signal[A] =
-    Mailbox.mailbox(x).signal
+    new SignalImpl(new Observable(Some(x)))
 
   def merge[A]
   (xs: Signal[A]*)
   (implicit executor: ExecutionContext): Signal[A] = {
-    val newSignal = new SignalImpl[A](new Observable(None))
-    for (x <- xs)
-      x match {
-        case signal: SignalImpl[A] =>
-          signal.observable.addObserver(newSignal.observable.onNextSync)
-        case other =>
-      }
-    newSignal
+    val newObservable = new Observable[A](None)
+    for {
+      signal <- xs
+      value <- signal
+    } newObservable.onNext(value)
+    new SignalImpl(newObservable)
   }
 }
 
 private class SignalImpl[A]
 (val observable: Observable[A])
 (implicit executor: ExecutionContext) extends Signal[A] {
+
   override def dropRepeats(): Signal[A] = {
-    val newSignal = new SignalImpl[A](new Observable(None))
-    val lock = new Object
-    var previousValue: Option[A] = None
-    observable.addObserver({ x =>
-      lock.synchronized {
-        if (!previousValue.contains(x)) {
-          previousValue = Some(x)
-          newSignal.observable.onNextSync(x)
-        }
+    val newObservable = new Observable[A](None)
+    observable.subscribe { currentValue =>
+      newObservable.onUpdate {
+        case None => Some(currentValue)
+        case Some(previousValue) =>
+          if (previousValue != currentValue) Some(currentValue)
+          else None
       }
-    })
-    newSignal
+    }
+    new SignalImpl(newObservable)
   }
 
   override def flatMap[B](f: (A) => Signal[B]): Signal[B] = {
-    val newSignal = new SignalImpl[B](new Observable(None))
-    observable.addObserver({ x =>
-      f(x) match {
-        case signal: SignalImpl[B] =>
-          signal.observable.addObserver(newSignal.observable.onNextSync)
-        case other =>
-      }
-    })
-    newSignal
+    val newObservable = new Observable[B](None)
+    observable.subscribe { v =>
+      f(v).foreach(newObservable.onNext)
+    }
+    new SignalImpl(newObservable)
   }
 
   override def filter(f: (A) => Boolean): Signal[A] = {
-    val newSignal = new SignalImpl[A](new Observable(None))
-    observable.addObserver({ x => if (f(x)) newSignal.observable.onNextSync(x) })
-    newSignal
+    val newObservable = new Observable[A](None)
+    observable.subscribe { v => if (f(v)) newObservable.onNext(v) }
+    new SignalImpl(newObservable)
   }
 
-  override def foldP[B](seed: B)(f: (A, B) => B): Signal[B] = {
-    val newSignal = new SignalImpl[B](new Observable(Some(seed)))
-    var state = seed
-    val lock = new Object
-    observable.addObserver({ x =>
-      lock.synchronized {
-        state = f(x, state)
-        newSignal.observable.onNextSync(state)
+  override def foldP[B](init: B)(f: (A, B) => B): Signal[B] = {
+    val newObservable = new Observable[B](Some(init))
+    observable.subscribe { v =>
+      newObservable.onUpdate {
+        case None => None
+        case Some(prev) => Some(f(v, prev))
       }
-    })
-    newSignal
-  }
-
-  override def map[B](f: (A) => B): Signal[B] = {
-    val newSignal = new SignalImpl[B](new Observable(None))
-    observable.addObserver({ x => newSignal.observable.onNextSync(f(x)) })
-    newSignal
+    }
+    new SignalImpl(newObservable)
   }
 
   override def sampleOn[B](on: Signal[B]): Signal[A] = {
-    val newSignal = new SignalImpl[A](new Observable(None))
-    on match {
-      case signal: SignalImpl[B] =>
-        signal.observable.addObserver({ y =>
-          for (x <- observable.state())
-            newSignal.observable.onNextSync(x)
-        })
-      case other =>
+    val newObservable = new Observable[A](None)
+    var currentValue: Option[A] = None
+    observable.subscribe { v => currentValue = Some(v) }
+    on.foreach { b =>
+      currentValue.foreach(k => newObservable.onNext(k))
     }
-    newSignal
+    new SignalImpl(newObservable)
   }
+
+  override def map[B](f: (A) => B): Signal[B] = {
+    val newObservable = new Observable[B](None)
+    observable.subscribe { v => newObservable.onNext(f(v)) }
+    new SignalImpl(newObservable)
+  }
+
+  override def foreach[U](f: (A) => U): Unit =
+    observable.subscribe { v => f(v) }
 }
 
 object StartApp {
